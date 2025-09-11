@@ -81,7 +81,7 @@
     when: controlplane.stat.exists == false
     delegate_to: localhost
     ansible.builtin.command: |
-      talosctl gen config {{ cluster_name }} https://{{ inventory_hostname }}:6443 \
+      talosctl gen config {{ cluster_name }} https://{{ ansible_host | default(inventory_hostname) }}:6443 \
         --config-patch @../patchs/all.yaml \
         --config-patch-control-plane @../patchs/controlplane.yaml \
         -o {{ inventory_dir }}
