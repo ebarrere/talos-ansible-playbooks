@@ -10,6 +10,10 @@ ifdef VERBOSE ## Set ansible in verbose mode (bool)
 	VERBOSE_OPTS=-vvv
 endif
 
+ifndef TALOS_SCHEMATIC ## Talos schematic to use (using proxmox.yaml by default)
+	TALOS_SCHEMATIC=proxmox.yaml
+endif
+
 ANSIBLE_OPTS=-i ../inventory.ini $(VERBOSE_OPTS)
 ANSIBLE_PLAYBOOK=ansible-playbook $(ANSIBLE_OPTS)
 
@@ -28,7 +32,7 @@ schematic.json: ## Get schematic json data from the talos factory
 	$(WHICH) curl
 	$(WHICH) tee
 	$(WHICH) talosctl
-	curl -X POST --data-binary @bare-metal.yaml $(TALOS_FACTORY_URL)/schematics -o schematic.json
+	curl -X POST --data-binary @$(TALOS_SCHEMATIC) $(TALOS_FACTORY_URL)/schematics -o schematic.json
 
 metal-amd64.iso: schematic.json ## Download amd64 iso from the talos factory
 	$(WHICH) jq
@@ -40,6 +44,11 @@ metal-arm64.iso: schematic.json ## Download arm64 iso from the talos factory
 	$(WHICH) jq
 	$(WHICH) wget
 	wget $(TALOS_FACTORY_URL)/image/$(shell cat schematic.json | jq -r ".id")/$(TALOS_VERSION)/metal-arm64.iso
+
+proxmox.iso: schematic.json ## Download proxmox iso from the talos factory
+	$(WHICH) jq
+	$(WHICH) wget
+	wget $(TALOS_FACTORY_URL)/image/$(shell cat schematic.json | jq -r ".id")/$(TALOS_VERSION)/nocloud-amd64.iso
 
 architecture.svg: architecture.drawio ## Create architecture
 	$(WHICH) $(DRAWIO_BIN)
