@@ -64,6 +64,6 @@
   retries: 30
   delay: 60
   changed_when: false
-  ansible.builtin.shell: kubectl get nodes {{ ansible_host | default(inventory_hostname) }}
+  ansible.builtin.shell: kubectl get nodes {{ inventory_hostname }}
   environment:
     no_proxy: "{{ ansible_host | default(inventory_hostname) }}"
