@@ -8,8 +8,12 @@ ifdef VERBOSE ## Set ansible in verbose mode (bool)
 	VERBOSE_OPTS=-vvv
 endif
 
+ifdef CHECK ## Dry-run everything (ansible --check)
+	CHECK_OPTS=--check
+endif
+
 ANSIBLE_OPTS=-i ../inventory.ini \
-	$(LIMIT_OPTS) $(VERBOSE_OPTS)
+	$(LIMIT_OPTS) $(CHECK_OPTS) $(VERBOSE_OPTS)
 
 ANSIBLE_PLAYBOOK=ansible-playbook $(ANSIBLE_OPTS)
 

@@ -7,23 +7,31 @@
     adding_node: true
 
   tasks:
-  - name: Adding new nodes | Get cluster members
+  # Only READY nodes count as members. A rebuilt node's stale k8s node lingers
+  # as NotReady with the same IP; treating it as a member would wrongly skip the
+  # rejoin. Matching Ready-only makes 'add-nodes' also repair degraded nodes.
+  - name: Adding new nodes | Get Ready cluster members (internal IPs)
     changed_when: false
     failed_when: members.stdout_lines | length == 0
     delegate_to: localhost
     register: members
     run_once: true
-    ansible.builtin.command: kubectl get nodes -o=jsonpath='{.items..status.addresses[?(@.type=="InternalIP")].address}'
+    check_mode: false
+    ansible.builtin.shell: |
+      kubectl get nodes -o wide --no-headers | awk '$2 == "Ready" { print $6 }'
 
   - name: Adding new nodes | Setting facts
     set_fact:
-      nodes: '{{ members.stdout | split(" ") }}'
+      ready_ips: '{{ members.stdout_lines }}'
 
-  - name: Adding new nodes | Configuring if not a member yet
-    when: not ansible_host | default(inventory_hostname) in nodes
+  - name: Adding new nodes | (Re)join if not a healthy member
+    when: (ansible_host | default(inventory_hostname)) not in ready_ips
     block:
-    - name: Adding new nodes | Configuring the new node
+    - name: Adding new nodes | Clean stale etcd/k8s membership (rebuilt node)
+      include_tasks: '{{ inventory_dir }}/tasks/rejoin-cleanup.yml'
+
+    - name: Adding new nodes | Generate host config
       include_tasks: '{{ inventory_dir }}/tasks/gen-host-conf.yml'
 
-    - name: Adding new nodes | Applying configuration
+    - name: Adding new nodes | Apply configuration
       include_tasks: '{{ inventory_dir }}/tasks/apply-host-conf.yml'

@@ -4,23 +4,33 @@
   serial: 1
 
   tasks:
-  - name: Applying configuration | Check if the cluster has already been bootstrapped
+  - name: Applying configuration | Check if the cluster is already deployed
     delegate_to: localhost
     run_once: true
     register: kube_context
     failed_when: false
     changed_when: false
+    check_mode: false
     ansible.builtin.shell: |
       kubectl config get-contexts | awk '{print $1,$3}' | fgrep '* {{ cluster_name }}'
 
-  - name: Applying configuration | Check if the cluster has already been bootstrapped
-    assert:
-      that: kube_context.stdout_lines | length == 0
-      fail_msg: |
-        The cluster has already been deployed. Switch to '../day-2' operations directory and use 'add-nodes' target.
+  # Idempotent: on an already-deployed cluster, skip the create-time (maintenance
+  # mode, --insecure) apply instead of failing. New/rebuilt control-plane and
+  # worker nodes are (re)joined idempotently by the day-2 'add-nodes' step, which
+  # cluster-create runs next -- so a single 'make talos' both builds and repairs.
+  - name: Applying configuration | Already deployed -> skip create-time apply
+    delegate_to: localhost
+    run_once: true
+    when: kube_context.stdout_lines | length > 0
+    ansible.builtin.debug:
+      msg: >-
+        Cluster '{{ cluster_name }}' is already deployed; skipping control-plane
+        apply-config. New or rebuilt nodes are handled by the add-nodes step.
 
-  - name: Applying configuration | Including tasks
+  - name: Applying configuration | Generate host config
     include_tasks: '{{ inventory_dir }}/tasks/gen-host-conf.yml'
+    when: kube_context.stdout_lines | length == 0
 
-  - name: Applying configuration | Including tasks
+  - name: Applying configuration | Apply host config
     include_tasks: '{{ inventory_dir }}/tasks/apply-host-conf.yml'
+    when: kube_context.stdout_lines | length == 0

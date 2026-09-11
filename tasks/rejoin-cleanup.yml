@@ -1,0 +1,63 @@
+---
+# Remove a rebuilt node's stale membership before it (re)joins the cluster.
+# Idempotent + fail-safe: only removes an etcd member / k8s node that exists,
+# always talks to a HEALTHY control-plane (never the node being replaced), and
+# HARD-FAILS if removing the etcd member would break quorum. No-op for a
+# brand-new node that was never a member.
+- name: Rejoin | Healthy control-planes (Ready, excluding this node)
+  set_fact:
+    healthy_cps: >-
+      {{ groups['controlplane'] | map('extract', hostvars, 'ansible_host') | list
+         | intersect(ready_ips) | difference([ansible_host | default(inventory_hostname)]) }}
+
+- name: Rejoin | Abort if no healthy control-plane is available
+  ansible.builtin.assert:
+    that: healthy_cps | length > 0
+    fail_msg: "No healthy control-plane to run etcd/k8s cleanup against -- refusing to touch the cluster."
+
+- name: Rejoin | Set the healthy endpoint
+  set_fact:
+    healthy_cp_ip: "{{ healthy_cps | first }}"
+
+# talosctl etcd remove-member takes a member ID (hex), not a hostname. This task
+# looks up the ID for this node, and REFUSES (exit 1 -> task fails) if removing
+# it would leave fewer healthy members than the post-removal etcd quorum. Reads
+# run even in --check (check_mode: false) so the gate is always evaluated; the
+# removal itself is skipped in --check.
+- name: Rejoin | Remove stale etcd member for {{ inventory_hostname }} (quorum-gated)
+  delegate_to: localhost
+  when: inventory_hostname in groups['controlplane']
+  register: etcd_rm
+  check_mode: false
+  changed_when: "'REMOVING' in etcd_rm.stdout"
+  failed_when: etcd_rm.rc != 0
+  vars:
+    healthy_remaining: "{{ healthy_cps | length }}"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    TC="talosctl --talosconfig {{ inventory_dir }}/talosconfig -n {{ healthy_cp_ip }} -e {{ healthy_cp_ip }}"
+    MEMBERS="$($TC etcd members)"                       # fails (set -e) if etcd not quorate -> abort
+    ID="$(echo "$MEMBERS" | awk '$3 == "{{ inventory_hostname }}" {print $2}')"
+    if [ -z "$ID" ]; then echo "no stale etcd member for {{ inventory_hostname }}"; exit 0; fi
+    TOTAL="$(echo "$MEMBERS" | tail -n +2 | grep -c .)"
+    NEW_QUORUM=$(( (TOTAL - 1) / 2 + 1 ))
+    HEALTHY={{ healthy_remaining }}
+    echo "etcd: total=$TOTAL healthy_remaining=$HEALTHY post_removal_quorum=$NEW_QUORUM member=$ID"
+    if [ "$HEALTHY" -lt "$NEW_QUORUM" ]; then
+      echo "QUORUM GATE: removing {{ inventory_hostname }} leaves $HEALTHY healthy < quorum $NEW_QUORUM -- REFUSING" >&2
+      exit 1
+    fi
+    {% if not ansible_check_mode %}
+    echo "REMOVING etcd member {{ inventory_hostname }} ($ID)"
+    $TC etcd remove-member "$ID"
+    {% else %}
+    echo "(check mode) would remove etcd member {{ inventory_hostname }} ($ID)"
+    {% endif %}
+  args:
+    executable: /bin/bash
+
+- name: Rejoin | Delete stale kubernetes node {{ inventory_hostname }}
+  delegate_to: localhost
+  changed_when: true
+  failed_when: false
+  ansible.builtin.command: kubectl delete node {{ inventory_hostname }} --ignore-not-found --wait=false

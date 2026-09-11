@@ -23,7 +23,12 @@
     - bootstrap.rc == 0
     - bootstrap.stderr_lines[1] | regex_search("AlreadyExists") == ""
 
+  # Only wait for full-cluster health after an actual fresh bootstrap. On an
+  # already-deployed cluster (bootstrap returns AlreadyExists -> not changed)
+  # this would hang forever waiting on the very nodes we're about to repair in
+  # the add-nodes step, so skip it and let the repair proceed.
   - name: Bootstrap | Wait for the node to be ready
+    when: bootstrap.changed
     until: health is success
     delay: 30
     retries: 30
@@ -35,6 +40,7 @@
       no_proxy: "{{ ansible_host | default(inventory_hostname) }}"
 
   - name: Bootstrap | Get kubernetes configuration
+    when: bootstrap.changed
     delegate_to: localhost
     ansible.builtin.command: talosctl {{ talosctl_opts }} kubeconfig
     environment:
