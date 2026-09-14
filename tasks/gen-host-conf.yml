@@ -44,3 +44,34 @@
       talosctl machineconfig patch {{ inventory_dir }}/{{ inventory_hostname }}.host.yaml
       --patch '[{"op":"add","path":"/machine/network/interfaces/0/vip","value":{"ip":"{{ controlplane_vip }}"}}]'
       -o {{ inventory_dir }}/{{ inventory_hostname }}.host.yaml
+
+  # cluster.controlPlane.endpoint lives in EVERY node's config (workers included)
+  # and KubePrism targets it, so the VIP endpoint must be baked on ALL nodes --
+  # else a rebuilt/added worker funnels API traffic to the stale gen-time first-CP
+  # IP (the generic worker.yaml/controlplane.yaml keep that old endpoint). This
+  # overrides it per host. Gated, idempotent upsert.
+  - name: Configuration generation | Point controlPlane.endpoint at the VIP (all nodes)
+    when: controlplane_vip | default('') | length > 0
+    delegate_to: localhost
+    ansible.builtin.command: >-
+      talosctl machineconfig patch {{ inventory_dir }}/{{ inventory_hostname }}.host.yaml
+      --patch '[{"op":"add","path":"/cluster/controlPlane/endpoint","value":"https://{{ controlplane_vip }}:6443"}]'
+      -o {{ inventory_dir }}/{{ inventory_hostname }}.host.yaml
+
+  # A newly-added control-plane's apiserver cert must be valid for the VIP.
+  - name: Configuration generation | Compute control-plane certSANs (incl. VIP)
+    when:
+      - inventory_hostname in groups['controlplane']
+      - controlplane_vip | default('') | length > 0
+    set_fact:
+      cp_certsans: "{{ (groups['controlplane'] | map('extract', hostvars, 'ansible_host') | list) + [controlplane_vip] }}"
+
+  - name: Configuration generation | Add the VIP to apiServer certSANs (control-plane)
+    when:
+      - inventory_hostname in groups['controlplane']
+      - controlplane_vip | default('') | length > 0
+    delegate_to: localhost
+    ansible.builtin.command: >-
+      talosctl machineconfig patch {{ inventory_dir }}/{{ inventory_hostname }}.host.yaml
+      --patch '[{"op":"add","path":"/cluster/apiServer/certSANs","value":{{ cp_certsans | to_json }}}]'
+      -o {{ inventory_dir }}/{{ inventory_hostname }}.host.yaml
