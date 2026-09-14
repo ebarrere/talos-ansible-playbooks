@@ -77,11 +77,14 @@
       content: '{{ cilium | to_yaml }}'
       dest: ../patchs/controlplane.yaml
 
+  # Endpoint = the VIP when controlplane_vip is set (so a from-scratch build bakes
+  # the VIP into controlPlane.endpoint AND auto-adds it to the apiserver certSANs);
+  # otherwise the first controlplane node IP, the pre-VIP behaviour.
   - name: Configuration generation | Create talos configuration for the cluster (talosconfig, worker.yaml, controlplane.yaml)
     when: controlplane.stat.exists == false
     delegate_to: localhost
     ansible.builtin.command: |
-      talosctl gen config {{ cluster_name }} https://{{ ansible_host | default(inventory_hostname) }}:6443 \
+      talosctl gen config {{ cluster_name }} https://{{ controlplane_vip if (controlplane_vip | default('') | length > 0) else (ansible_host | default(inventory_hostname)) }}:6443 \
         --config-patch @../patchs/all.yaml \
         --config-patch-control-plane @../patchs/controlplane.yaml \
         -o {{ inventory_dir }}

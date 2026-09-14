@@ -1,0 +1,174 @@
+###############################################################################
+# Converge corrected host networking + control-plane VIP onto a LIVE Talos
+# cluster (idempotent).
+#
+# Fixes a latent misconfig: interfaces were bound by deviceSelector.busPath
+# (0000:00:01.0/02.0) which match NO NIC on these virtio VMs, so the block was
+# inert -- addresses only landed via Talos order-fallback and the VIP operator
+# never bound. This binds by kernel name (eth0=mgmt, eth1=services) with STATIC
+# addresses = each node's assigned IP (== ansible_host), plus gateway + DNS, and
+# adds the VIP (+ certSANs) on the control plane, then points the canonical k8s
+# endpoint + local kubeconfig at the VIP.
+#
+# SAFETY:
+#   * Patches the RUNNING config (`--mode=no-reboot`); never regenerates -> PKI
+#     is preserved. Static addresses equal the current IPs, so the DHCP->static
+#     switch is a no-op on the wire (same IP/gateway/DNS).
+#   * Workers first, then control-plane, serial=1, all-nodes-Ready gate between
+#     every node. certSANs gain the VIP BEFORE the endpoint is flipped to it.
+#   * Idempotent: JSON6902 add/replace are upserts; Talos apply is a no-op when
+#     unchanged -> a second run is changed=0.
+#
+# Run:  ansible-playbook -i inventory.ini day-2/playbooks/apply-node-network.yml
+###############################################################################
+
+- name: Net | Preflight
+  hosts: all
+  gather_facts: false
+  become: false
+  run_once: true
+  vars:
+    talosconfig: "{{ inventory_dir }}/talosconfig"
+  tasks:
+    - name: Net | Require controlplane_vip + network vars
+      ansible.builtin.assert:
+        that:
+          - controlplane_vip | default('') | length > 0
+          - mgmt_gateway | default('') | length > 0
+          - dns_servers | default([]) | length > 0
+        fail_msg: "Set controlplane_vip, mgmt_gateway, dns_servers in inventory/talos/group_vars/all.yml"
+
+    - name: Net | talosconfig must exist (never regenerate -> would remint the CA)
+      ansible.builtin.stat:
+        path: "{{ talosconfig }}"
+      delegate_to: localhost
+      register: net_talosconfig
+      failed_when: not net_talosconfig.stat.exists
+
+    - name: Net | Preflight gate - cluster healthy before we start
+      ansible.builtin.import_tasks: ../../tasks/wait-nodes-ready.yml
+
+# The corrected network patch is per-node (static addr = its own IP). eth0 gets
+# the VIP + certSANs on control-plane nodes only. Workers first so the endpoint
+# node (cp-1) changes last.
+- name: Net | Pass 1a - corrected static network on WORKERS
+  hosts: worker
+  gather_facts: false
+  become: false
+  serial: 1
+  vars:
+    talosconfig: "{{ inventory_dir }}/talosconfig"
+  tasks:
+    - name: "Net | {{ inventory_hostname }}: build patch"
+      ansible.builtin.set_fact:
+        net_patch:
+          - op: replace
+            path: /machine/network/interfaces
+            value:
+              - {interface: eth0, addresses: ["{{ ansible_host }}/{{ mgmt_prefix }}"], routes: [{network: "0.0.0.0/0", gateway: "{{ mgmt_gateway }}"}]}
+              - {interface: eth1, addresses: ["{{ eth1_addr_cidr }}"]}
+          - op: add
+            path: /machine/network/nameservers
+            value: "{{ dns_servers }}"
+    - name: "Net | {{ inventory_hostname }}: apply corrected network"
+      ansible.builtin.command: >-
+        talosctl --talosconfig {{ talosconfig }} -e {{ ansible_host }} -n {{ ansible_host }}
+        patch machineconfig --mode=no-reboot --patch '{{ net_patch | to_json }}'
+      delegate_to: localhost
+      changed_when: false
+    - name: "Net | Gate after {{ inventory_hostname }}"
+      ansible.builtin.import_tasks: ../../tasks/wait-nodes-ready.yml
+
+- name: Net | Pass 1b - corrected static network + VIP + certSANs on CONTROL-PLANE
+  hosts: controlplane
+  gather_facts: false
+  become: false
+  serial: 1
+  vars:
+    talosconfig: "{{ inventory_dir }}/talosconfig"
+    cp_certsans: "{{ (groups['controlplane'] | map('extract', hostvars, 'ansible_host') | list) + [controlplane_vip] }}"
+  tasks:
+    - name: "Net | {{ inventory_hostname }}: build patch (eth0 carries the VIP)"
+      ansible.builtin.set_fact:
+        net_patch:
+          - op: replace
+            path: /machine/network/interfaces
+            value:
+              - {interface: eth0, addresses: ["{{ ansible_host }}/{{ mgmt_prefix }}"], routes: [{network: "0.0.0.0/0", gateway: "{{ mgmt_gateway }}"}], vip: {ip: "{{ controlplane_vip }}"}}
+              - {interface: eth1, addresses: ["{{ eth1_addr_cidr }}"]}
+          - op: add
+            path: /machine/network/nameservers
+            value: "{{ dns_servers }}"
+          - op: add
+            path: /cluster/apiServer/certSANs
+            value: "{{ cp_certsans }}"
+    - name: "Net | {{ inventory_hostname }}: apply corrected network + VIP + certSANs"
+      ansible.builtin.command: >-
+        talosctl --talosconfig {{ talosconfig }} -e {{ ansible_host }} -n {{ ansible_host }}
+        patch machineconfig --mode=no-reboot --patch '{{ net_patch | to_json }}'
+      delegate_to: localhost
+      changed_when: false
+    - name: "Net | Gate after {{ inventory_hostname }}"
+      ansible.builtin.import_tasks: ../../tasks/wait-nodes-ready.yml
+
+- name: Net | Confirm the VIP serves the API
+  hosts: controlplane
+  gather_facts: false
+  become: false
+  run_once: true
+  tasks:
+    - name: Net | Wait for https://{{ controlplane_vip }}:6443 to answer
+      ansible.builtin.uri:
+        url: "https://{{ controlplane_vip }}:6443/version"
+        validate_certs: false
+        status_code: [401, 403]
+        timeout: 5
+      register: vip_probe
+      until: vip_probe.status in [401, 403]
+      retries: 24
+      delay: 5
+      delegate_to: localhost
+
+- name: Net | Pass 2 - point the canonical endpoint at the VIP
+  hosts: controlplane
+  gather_facts: false
+  become: false
+  serial: 1
+  vars:
+    talosconfig: "{{ inventory_dir }}/talosconfig"
+    endpoint_patch:
+      - {op: add, path: /cluster/controlPlane/endpoint, value: "https://{{ controlplane_vip }}:6443"}
+  tasks:
+    - name: "Net | {{ inventory_hostname }}: controlPlane.endpoint -> VIP"
+      ansible.builtin.command: >-
+        talosctl --talosconfig {{ talosconfig }} -e {{ ansible_host }} -n {{ ansible_host }}
+        patch machineconfig --mode=no-reboot --patch '{{ endpoint_patch | to_json }}'
+      delegate_to: localhost
+      changed_when: false
+    - name: "Net | Gate after {{ inventory_hostname }}"
+      ansible.builtin.import_tasks: ../../tasks/wait-nodes-ready.yml
+
+- name: Net | Point local kubeconfig at the VIP + final verify
+  hosts: controlplane
+  gather_facts: false
+  become: false
+  run_once: true
+  vars:
+    talosconfig: "{{ inventory_dir }}/talosconfig"
+    cp_ips: "{{ groups['controlplane'] | map('extract', hostvars, 'ansible_host') | list }}"
+  tasks:
+    - name: Net | Rewrite kubeconfig server (any CP node IP -> VIP)
+      ansible.builtin.replace:
+        path: "{{ lookup('env', 'HOME') }}/.kube/config"
+        regexp: 'https://(?:{{ cp_ips | join("|") }}):6443'
+        replace: "https://{{ controlplane_vip }}:6443"
+      delegate_to: localhost
+
+    - name: Net | Final gate - all nodes Ready via the VIP
+      ansible.builtin.import_tasks: ../../tasks/wait-nodes-ready.yml
+
+    - name: Net | Done
+      ansible.builtin.debug:
+        msg: >-
+          Corrected host networking (eth0/eth1 static by name) applied to all nodes;
+          control-plane VIP {{ controlplane_vip }} is live + canonical (all nodes Ready).

@@ -31,3 +31,16 @@
       talosctl machineconfig patch {{ inventory_dir }}/{{ generic_machineconfig }} \
         --patch @{{ patch_dir }}/{{ inventory_hostname }}.host.yaml \
         -o {{ inventory_dir }}/{{ inventory_hostname }}.host.yaml
+
+  # CP-only VIP on the mgmt interface (index 0, written by the patch above).
+  # Gated on the var so workers + the pre-VIP config are untouched (idempotent:
+  # JSON6902 add on an object member is an upsert).
+  - name: Configuration generation | Inject the control-plane VIP (interface 0)
+    when:
+      - inventory_hostname in groups['controlplane']
+      - controlplane_vip | default('') | length > 0
+    delegate_to: localhost
+    ansible.builtin.command: >-
+      talosctl machineconfig patch {{ inventory_dir }}/{{ inventory_hostname }}.host.yaml
+      --patch '[{"op":"add","path":"/machine/network/interfaces/0/vip","value":{"ip":"{{ controlplane_vip }}"}}]'
+      -o {{ inventory_dir }}/{{ inventory_hostname }}.host.yaml
