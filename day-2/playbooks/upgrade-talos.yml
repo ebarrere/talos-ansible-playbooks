@@ -9,7 +9,10 @@
 
   - name: Upgrade talos | Starting the upgrade
     delegate_to: localhost
-    ansible.builtin.command: talosctl {{ talosctl_opts }} upgrade --preserve
+    # --image is REQUIRED: without it talosctl defaults to the vanilla installer
+    # and the node loses its factory schematic (extensions). talos_installer_image
+    # is composed from talos_version + talos_schematic_id in group_vars/all.yml.
+    ansible.builtin.command: talosctl {{ talosctl_opts }} upgrade --preserve --image {{ talos_installer_image }}
 
 - hosts: worker
   gather_facts: no
@@ -33,7 +36,10 @@
 
   - name: Upgrade talos | Starting the upgrade
     delegate_to: localhost
-    ansible.builtin.command: talosctl {{ talosctl_opts }} upgrade --preserve
+    # --image is REQUIRED: without it talosctl defaults to the vanilla installer
+    # and the node loses its factory schematic (extensions). talos_installer_image
+    # is composed from talos_version + talos_schematic_id in group_vars/all.yml.
+    ansible.builtin.command: talosctl {{ talosctl_opts }} upgrade --preserve --image {{ talos_installer_image }}
 
   - name: Upgrade talos | Wait for cilium to be healthy
     delegate_to: localhost
