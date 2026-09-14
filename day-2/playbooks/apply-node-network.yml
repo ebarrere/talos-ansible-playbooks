@@ -129,8 +129,12 @@
       delay: 5
       delegate_to: localhost
 
-- name: Net | Pass 2 - point the canonical endpoint at the VIP
-  hosts: controlplane
+# Every node (workers included) carries cluster.controlPlane.endpoint and its
+# KubePrism targets it -- so the endpoint must flip on ALL nodes, not just the
+# control plane. Flipping only CPs leaves workers pointed at the old cp-1 IP,
+# which strands them the moment that node's API path fails.
+- name: Net | Pass 2 - point the canonical endpoint at the VIP (all nodes)
+  hosts: all
   gather_facts: false
   become: false
   serial: 1
