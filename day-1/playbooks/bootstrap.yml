@@ -62,13 +62,23 @@
     - name: Bootstrap | Test if we are using a VIP for the controlplane
       delegate_to: localhost
       ansible.builtin.uri:
+        # 401 or 403: both prove a kubernetes API server answered on the VIP,
+        # which is all this probe establishes. Newer clusters disable anonymous
+        # auth, so an unauthenticated request is rejected at authentication
+        # (401) rather than authorization (403) -- .21 answers 401 directly too,
+        # so it is the API version, not the VIP.
         url: "{{ vip_endpoint }}"
-        status_code: 403
+        status_code: [401, 403]
         use_proxy: false
         validate_certs: false
 
+    # replace, not `sed -i`: this is delegated to the control machine, and BSD
+    # sed (macOS) reads the argument after -i as a backup suffix, so the shell
+    # form fails there. The module is also idempotent and reports changed
+    # honestly, which the command form could not.
     - name: Bootstrap | Update the kubectl context
       delegate_to: localhost
-      ansible.builtin.command: |
-        sed -i "s#{{ node_endpoint }}#{{ vip_endpoint }}#" \
-          {{ ansible_env.HOME }}/.kube/config
+      ansible.builtin.replace:
+        path: "{{ lookup('env', 'HOME') }}/.kube/config"
+        regexp: "{{ node_endpoint | regex_escape }}"
+        replace: "{{ vip_endpoint }}"
