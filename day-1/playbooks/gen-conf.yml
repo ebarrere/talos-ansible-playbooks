@@ -85,6 +85,7 @@
     delegate_to: localhost
     ansible.builtin.command: |
       talosctl gen config {{ cluster_name }} https://{{ controlplane_vip if (controlplane_vip | default('') | length > 0) else (ansible_host | default(inventory_hostname)) }}:6443 \
+        --kubernetes-version {{ kubernetes_version | regex_replace('^v', '') }} \
         --config-patch @../patchs/all.yaml \
         --config-patch-control-plane @../patchs/controlplane.yaml \
         -o {{ inventory_dir }}
