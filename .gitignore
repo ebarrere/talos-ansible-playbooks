@@ -10,6 +10,7 @@ schematic.json
 
 # Talos Linux extensions
 day-1/extensions/*.yaml
+day-1/extensions/*.yml
 
 # Ansible artifacts
 *.ini

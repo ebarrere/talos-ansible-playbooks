@@ -1,0 +1,88 @@
+# ExtensionServiceConfig docs for the schematic's extensions. Applied on node add
+# AND before upgrade: an extension service with no config sits at "Waiting for
+# extension service config", which holds the node in stage `booting` (cordoned)
+# and hangs `talosctl upgrade --wait`. Expects `talosctl_patch_opts`.
+# extension_vault_item: Bitwarden item holding the ansible-vault password.
+- name: Extension configs | Find vaulted configs
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.set_fact:
+    extension_vaults: "{{ query('ansible.builtin.fileglob', inventory_dir ~ '/day-1/extensions/*.yaml.vault') }}"
+
+- name: Extension configs | Vault password from Bitwarden
+  # Secrets (e.g. Tailscale TS_AUTHKEY) are committed as *.yaml.vault; the
+  # ansible-vault password lives in Bitwarden. Only fetched when a vault exists.
+  when: extension_vaults | length > 0
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+  ansible.builtin.set_fact:
+    extension_vault_pass: >-
+      {{ lookup('community.general.bitwarden', extension_vault_item, field='password', errors='ignore') | default([''], true) | first }}
+
+- name: Extension configs | Require the vault password
+  when: extension_vaults | length > 0
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.assert:
+    quiet: true
+    that: extension_vault_pass | default('') | length > 0
+    fail_msg: >-
+      Can't decrypt {{ extension_vaults | map('basename') | join(', ') }}: no password from
+      Bitwarden item "{{ extension_vault_item }}". Run `bw unlock` and export BW_SESSION.
+
+- name: Extension configs | Decrypt vaulted configs
+  # talosctl needs plaintext on disk; the decrypted *.yaml is gitignored.
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+  loop: "{{ extension_vaults }}"
+  ansible.builtin.command:
+    cmd: ansible-vault view --vault-password-file /dev/stdin {{ item }}
+    stdin: "{{ extension_vault_pass }}"
+  changed_when: false
+  register: extension_plain
+
+- name: Extension configs | Write decrypted configs
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+  loop: "{{ extension_plain.results | default([]) }}"
+  ansible.builtin.copy:
+    content: "{{ item.stdout }}\n"
+    dest: "{{ item.item | regex_replace('\\.vault$', '') }}"
+    mode: '0600'
+
+- name: Extension configs | Patch the machine configuration
+  # Replace, never merge: a plain `patch mc` merges into an existing document and
+  # APPENDS to its lists (environment), duplicating entries on every run. So
+  # delete + re-add when the document exists (deleting an absent one panics),
+  # and dry-run first: a real apply reports "Applied" even when nothing changed.
+  # One ExtensionServiceConfig per file.
+  delegate_to: localhost
+  delay: 10
+  retries: 10
+  register: patch
+  until: patch is success
+  changed_when: "'no changes detected' not in patch.stdout"
+  with_fileglob:
+  - "{{ inventory_dir }}/day-1/extensions/*.yml"
+  - "{{ inventory_dir }}/day-1/extensions/*.yaml"
+  ansible.builtin.shell: |
+    set -o pipefail
+    name=$(awk '$1 == "name:" {print $2; exit}' {{ item }})
+    patches="--patch @{{ item }}"
+    if talosctl get extensionserviceconfigs "$name" {{ talosctl_patch_opts }} >/dev/null 2>&1; then
+      del=$(mktemp); trap 'rm -f "$del"' EXIT
+      printf 'apiVersion: v1alpha1\nkind: ExtensionServiceConfig\nname: %s\n$patch: delete\n' "$name" > "$del"
+      patches="--patch @$del $patches"
+    fi
+    if talosctl patch mc {{ talosctl_patch_opts }} --dry-run $patches 2>&1 | grep -q 'no changes detected'; then
+      echo 'no changes detected'
+    else
+      talosctl patch mc {{ talosctl_patch_opts }} $patches
+    fi
+  args:
+    executable: /bin/bash
+  environment:
+    no_proxy: "{{ ansible_host | default(inventory_hostname) }}"

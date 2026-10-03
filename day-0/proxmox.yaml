@@ -1,3 +1,5 @@
 customization:
   systemExtensions:
-    officialExtensions: ["siderolabs/qemu-guest-agent"]
+    officialExtensions:
+    - siderolabs/qemu-guest-agent
+    - siderolabs/tailscale
