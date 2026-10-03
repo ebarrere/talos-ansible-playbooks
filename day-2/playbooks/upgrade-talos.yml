@@ -6,16 +6,27 @@
   - name: Upgrading talos | Setting facts
     set_fact:
       talosctl_opts: --talosconfig={{ inventory_dir }}/talosconfig  -e {{ ansible_host | default(inventory_hostname) }} -n {{ inventory_hostname }}
+      talosctl_patch_opts: --talosconfig {{ inventory_dir }}/talosconfig -e {{ ansible_host | default(inventory_hostname) }} -n {{ inventory_hostname }}
 
-  - name: Upgrade talos | Get current version
-    # Idempotency guard: only upgrade nodes not already on talos_version, so a
-    # re-run doesn't needlessly reboot healthy nodes.
+  - name: Upgrade talos | Extension configs
+    # Before the upgrade: a new extension without its config holds the node in
+    # `booting` and hangs `talosctl upgrade --wait`.
+    ansible.builtin.include_tasks: "{{ inventory_dir }}/tasks/extension-configs.yml"
+
+  - name: Upgrade talos | Get running installer image
+    # Idempotency guard: compare what the node RUNS (schematic extension + server
+    # version) with the target image. Not the machine config's install.image:
+    # `talosctl upgrade` never rewrites it, so it goes stale after the first
+    # upgrade. The schematic matters: adding an extension changes it while
+    # talos_version stays put.
     delegate_to: localhost
     changed_when: false
     check_mode: false
     ansible.builtin.shell: |
       set -o pipefail
-      talosctl {{ talosctl_opts }} version 2>/dev/null | awk '/Server:/{s=1} s&&/Tag:/{print $2; exit}'
+      s=$(talosctl {{ talosctl_opts }} get extensions -o yaml | awk '$1=="name:" && $2=="schematic" {getline; print $2; exit}')
+      v=$(talosctl {{ talosctl_opts }} version | awk '/^Server:/ {srv=1} srv && $1=="Tag:" {print $2; exit}')
+      echo "factory.talos.dev/installer/$s:$v"
     args:
       executable: /bin/bash
     register: current_talos
@@ -25,11 +36,11 @@
     # banner once from the first host in the play), but a debug msg does.
     ansible.builtin.debug:
       msg: >-
-        {{ inventory_hostname }}: {{ current_talos.stdout | default('unknown') }} -> {{ talos_version }}
-        [{{ 'upgrade' if current_talos.stdout != talos_version else 'already current, skip' }}]
+        {{ inventory_hostname }}: {{ current_talos.stdout | default('unknown') }} -> {{ talos_installer_image }}
+        [{{ 'upgrade' if current_talos.stdout != talos_installer_image else 'already current, skip' }}]
 
   - name: Upgrade talos | Run upgrade (skipped when already at target)
-    when: current_talos.stdout != talos_version
+    when: current_talos.stdout != talos_installer_image
     delegate_to: localhost
     # --image is REQUIRED: without it talosctl defaults to the vanilla installer
     # and the node loses its factory schematic (extensions). talos_installer_image
@@ -48,22 +59,37 @@
     run_once: true
     changed_when: false
     register: ceph_pods
+    until: ceph_pods is success   # rides out a brief API blip (e.g. VIP failover)
+    retries: 6
+    delay: 10
     delegate_to: localhost
     ansible.builtin.command: kubectl get pods -n rook-ceph
 
   - name: Upgrading talos | Setting facts
     set_fact:
       talosctl_opts: --talosconfig={{ inventory_dir }}/talosconfig  -e {{ ansible_host | default(inventory_hostname) }} -n {{ inventory_hostname }}
+      talosctl_patch_opts: --talosconfig {{ inventory_dir }}/talosconfig -e {{ ansible_host | default(inventory_hostname) }} -n {{ inventory_hostname }}
       use_ceph: '{% if ceph_pods.stdout_lines | length > 1 %}true{% else %}false{% endif %}'
 
-  - name: Upgrade talos | Get current version
-    # Idempotency guard: only upgrade nodes not already on talos_version.
+  - name: Upgrade talos | Extension configs
+    # Before the upgrade: a new extension without its config holds the node in
+    # `booting` and hangs `talosctl upgrade --wait`.
+    ansible.builtin.include_tasks: "{{ inventory_dir }}/tasks/extension-configs.yml"
+
+  - name: Upgrade talos | Get running installer image
+    # Idempotency guard: compare what the node RUNS (schematic extension + server
+    # version) with the target image. Not the machine config's install.image:
+    # `talosctl upgrade` never rewrites it, so it goes stale after the first
+    # upgrade. The schematic matters: adding an extension changes it while
+    # talos_version stays put.
     delegate_to: localhost
     changed_when: false
     check_mode: false
     ansible.builtin.shell: |
       set -o pipefail
-      talosctl {{ talosctl_opts }} version 2>/dev/null | awk '/Server:/{s=1} s&&/Tag:/{print $2; exit}'
+      s=$(talosctl {{ talosctl_opts }} get extensions -o yaml | awk '$1=="name:" && $2=="schematic" {getline; print $2; exit}')
+      v=$(talosctl {{ talosctl_opts }} version | awk '/^Server:/ {srv=1} srv && $1=="Tag:" {print $2; exit}')
+      echo "factory.talos.dev/installer/$s:$v"
     args:
       executable: /bin/bash
     register: current_talos
@@ -71,34 +97,52 @@
   - name: Upgrade talos | Plan
     ansible.builtin.debug:
       msg: >-
-        {{ inventory_hostname }}: {{ current_talos.stdout | default('unknown') }} -> {{ talos_version }}
-        [{{ 'upgrade' if current_talos.stdout != talos_version else 'already current, skip' }}]
+        {{ inventory_hostname }}: {{ current_talos.stdout | default('unknown') }} -> {{ talos_installer_image }}
+        [{{ 'upgrade' if current_talos.stdout != talos_installer_image else 'already current, skip' }}]
+
+  - name: Upgrade talos | Drain
+    # talosctl's own drain fetches a kubeconfig from the node it upgrades, which
+    # only control planes serve -- on a worker it fails after installing, before
+    # the reboot. So drain here and pass --drain=false.
+    when: current_talos.stdout != talos_installer_image
+    delegate_to: localhost
+    ansible.builtin.command: >-
+      kubectl drain {{ inventory_hostname }} --ignore-daemonsets --delete-emptydir-data
+      --timeout={{ drain_timeout | default('300s') }}
 
   - name: Upgrade talos | Run upgrade (skipped when already at target)
-    when: current_talos.stdout != talos_version
+    when: current_talos.stdout != talos_installer_image
     delegate_to: localhost
     # --image is REQUIRED: without it talosctl defaults to the vanilla installer
     # and the node loses its factory schematic (extensions). talos_installer_image
     # is composed from talos_version + talos_schematic_id in group_vars/all.yml.
-    ansible.builtin.command: talosctl {{ talosctl_opts }} upgrade --preserve --image {{ talos_installer_image }}
+    ansible.builtin.command: talosctl {{ talosctl_opts }} upgrade --preserve --drain=false --image {{ talos_installer_image }}
+
+  - name: Upgrade talos | Uncordon
+    # Always: also recovers a node left cordoned by an interrupted run.
+    delegate_to: localhost
+    register: uncordon
+    changed_when: "'already uncordoned' not in uncordon.stdout"
+    ansible.builtin.command: kubectl uncordon {{ inventory_hostname }}
 
   - name: Upgrade talos | Wait for cilium to be healthy
     # Use kubectl (already required) rather than the cilium CLI, which isn't a
     # documented dependency and may not be installed on the operator's machine.
-    # rollout status blocks until every cilium pod is updated + ready again.
-    when: current_talos.stdout != talos_version
+    # Only THIS node's pods: a daemonset-wide rollout status hangs whenever any
+    # other node is down.
+    when: current_talos.stdout != talos_installer_image
     delegate_to: localhost
     changed_when: false
     ansible.builtin.command: >-
       kubectl -n {{ cilium_namespace | default('kube-system') }}
-      rollout status daemonset/{{ item }}
-      --timeout={{ cilium_rollout_timeout | default('600s') }}
+      wait pod -l k8s-app={{ item }} --field-selector spec.nodeName={{ inventory_hostname }}
+      --for=condition=Ready --timeout={{ cilium_rollout_timeout | default('600s') }}
     loop: "{{ cilium_daemonsets | default(['cilium', 'cilium-envoy']) }}"
 
   - name: Upgrade talos | Wait for the ceph cluster to be started
     when:
       - use_ceph | lower == "true"
-      - current_talos.stdout != talos_version
+      - current_talos.stdout != talos_installer_image
     until: (bootstrap.stdout | from_yaml).status.health == "HEALTH_OK"
     delay: '{{ waiting_time_minutes * 60 }}'
     register: bootstrap
